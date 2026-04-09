@@ -1,0 +1,84 @@
+name: Watchdog — Monitor unassigned self-heal Issues
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+jobs:
+  check-unassigned:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+    steps:
+      - name: Check for unassigned self-heal Issues
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'self-heal',
+              per_page: 50,
+            });
+
+            const unassigned = issues.data.filter(i => i.assignees.length === 0);
+            if (unassigned.length === 0) {
+              console.log('할당 대기 중인 self-heal Issue가 없습니다.');
+              core.setOutput('found', 'false');
+              return;
+            }
+
+            core.setOutput('found', 'true');
+
+            const now = new Date();
+            const summaries = [];
+
+            for (const issue of unassigned) {
+              const createdAt = new Date(issue.created_at);
+              const elapsedMs = now - createdAt;
+              const elapsedHours = elapsedMs / (1000 * 60 * 60);
+
+              summaries.push(`#${issue.number}: ${issue.title} (${Math.round(elapsedHours * 10) / 10}시간 경과)`);
+
+              if (elapsedHours >= 1) {
+                const comments = await github.rest.issues.listComments({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  per_page: 10,
+                });
+                const alreadyWarned = comments.data.some(c =>
+                  c.body.includes('⏰') && c.body.includes('할당 대기 중입니다')
+                );
+                if (!alreadyWarned) {
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issue.number,
+                    body: '⏰ 이 Issue가 1시간 이상 할당 대기 중입니다. Copilot을 할당해주세요.',
+                  });
+                  console.log(`Issue #${issue.number}에 할당 리마인더 코멘트 추가`);
+                }
+              }
+            }
+
+            core.setOutput('summary', summaries.join('\n'));
+
+      - name: Notify Slack about unassigned Issues
+        if: steps.check.outputs.found == 'true' && env.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "⚠️ [Watchdog] 할당 대기 중인 Self-Heal Issue가 있습니다.\n\n${{ steps.check.outputs.summary }}\n\nhttps://github.com/${{ github.repository }}/issues?q=is%3Aopen+label%3Aself-heal+no%3Aassignee"
+            }

@@ -1,0 +1,193 @@
+name: Self-Heal — Auto-fix failed workflows
+
+on:
+  workflow_run:
+    workflows:
+      - "CI — Test & Lint"
+      - "CD — Deploy to Azure"
+      - "Infra — Provision Azure Resources"
+    types: [completed]
+
+jobs:
+  analyze-and-fix:
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      actions: read
+      contents: write
+
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect failure logs and create fix Issue
+        id: create-issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            const runName = run.name;
+            const runUrl = run.html_url;
+            const runId = run.id;
+
+            // 실패 job 로그 수집
+            const jobs = await github.rest.actions.listJobsForWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId,
+            });
+
+            let errorDetails = '';
+            let errorSummary = '';
+            for (const job of jobs.data.jobs) {
+              if (job.conclusion === 'failure') {
+                try {
+                  const logs = await github.rest.actions.downloadJobLogsForWorkflowRun({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    job_id: job.id,
+                  });
+                  const logLines = logs.data.split('\n');
+                  const tail = logLines.slice(-100).join('\n');
+                  const errorLines = logLines
+                    .filter(l => /error|Error|ERROR|failed|FAILED|ModuleNotFound|ImportError|BCP|exit code [1-9]/.test(l))
+                    .slice(-20)
+                    .join('\n');
+                  errorDetails += `\n### Job: ${job.name}\n\`\`\`\n${errorLines || tail.slice(-2000)}\n\`\`\`\n`;
+
+                  if (!errorSummary) {
+                    const firstError = logLines.find(l => /error|Error|ERROR/.test(l));
+                    if (firstError) {
+                      errorSummary = firstError.replace(/^\d{4}-\d{2}-\d{2}T[\d:.Z]+\s*/, '').trim().slice(0, 100);
+                    }
+                  }
+                } catch (e) {
+                  errorDetails += `\n### Job: ${job.name}\n로그 수집 실패: ${e.message}\n`;
+                }
+              }
+            }
+            if (!errorSummary) errorSummary = '에러 요약 추출 실패';
+
+            // 중복 Issue 체크
+            const existingIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'self-heal',
+              per_page: 10,
+            });
+            const duplicate = existingIssues.data.find(i =>
+              i.title.includes(runName)
+            );
+            if (duplicate) {
+              console.log(`Fix Issue already exists: #${duplicate.number}`);
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: duplicate.number,
+                body: `⚠️ 워크플로우가 다시 실패했습니다.\n\n- Run: ${runUrl}\n\n${errorDetails}`,
+              });
+              core.setOutput('skipped', 'true');
+              return;
+            }
+
+            // Fix Issue 생성
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[Self-Heal] ${runName} 실패 자동 수정`,
+              body: [
+                `## 🔧 워크플로우 실패 자동 감지`,
+                ``,
+                `| 항목 | 값 |`,
+                `|------|-----|`,
+                `| **워크플로우** | ${runName} |`,
+                `| **Run** | [#${runId}](${runUrl}) |`,
+                `| **브랜치** | ${run.head_branch} |`,
+                `| **커밋** | ${run.head_sha.slice(0, 7)} |`,
+                ``,
+                `### 에러 로그`,
+                errorDetails,
+                ``,
+                `### 요청`,
+                `위 에러를 분석하고 수정해주세요.`,
+                `수정 후 해당 워크플로우가 성공적으로 실행되어야 합니다.`,
+                ``,
+                `### 인수 조건`,
+                `- [ ] 에러 원인 파악 및 코드 수정`,
+                `- [ ] 수정 후 워크플로우 성공`,
+              ].join('\n'),
+              labels: ['self-heal'],
+            });
+
+            const issueNumber = issue.data.number;
+            const issueUrl = issue.data.html_url;
+            console.log(`Created fix Issue: #${issueNumber}`);
+
+            core.setOutput('skipped', 'false');
+            core.setOutput('issue_number', String(issueNumber));
+            core.setOutput('issue_url', issueUrl);
+            core.setOutput('workflow_name', runName);
+            core.setOutput('error_summary', errorSummary);
+
+      # ── Self-Heal 이력 기록 ──
+      - name: Update self-heal log
+        if: steps.create-issue.outputs.skipped != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const now = new Date();
+            const date = now.toISOString().slice(0, 16).replace('T', ' ');
+            const workflow = '${{ steps.create-issue.outputs.workflow_name }}';
+            const issueNum = '${{ steps.create-issue.outputs.issue_number }}';
+            const errorSummary = `${{ steps.create-issue.outputs.error_summary }}`;
+            const newRow = `| ${date} | ${workflow} | #${issueNum} | ${errorSummary} | pending |`;
+            const filePath = 'docs/self-heal-log.md';
+
+            let content = '';
+            let sha = undefined;
+            try {
+              const file = await github.rest.repos.getContent({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                path: filePath,
+              });
+              content = Buffer.from(file.data.content, 'base64').toString('utf8');
+              sha = file.data.sha;
+            } catch (e) {
+              content = [
+                '# Self-Heal 이력',
+                '',
+                '| 날짜 | 워크플로우 | Issue | 에러 요약 | 상태 |',
+                '|------|-----------|-------|----------|------|',
+                '',
+              ].join('\n');
+            }
+
+            const trimmed = content.trimEnd();
+            const updated = trimmed + '\n' + newRow + '\n';
+
+            await github.rest.repos.createOrUpdateFileContents({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              path: filePath,
+              message: `docs: self-heal 이력 추가 — Issue #${issueNum}`,
+              content: Buffer.from(updated).toString('base64'),
+              sha: sha,
+            });
+            console.log('Self-heal log updated');
+
+      # ── Slack 알림 (선택) ──
+      - name: Notify Slack
+        if: steps.create-issue.outputs.skipped != 'true' && env.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "🔧 [Self-Heal] ${{ steps.create-issue.outputs.workflow_name }} 실패 → Issue #${{ steps.create-issue.outputs.issue_number }} 생성됨. Copilot 할당이 필요합니다.\n${{ steps.create-issue.outputs.issue_url }}"
+            }
